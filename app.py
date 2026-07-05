@@ -404,7 +404,11 @@ async function act(kind, t, btn){
     const r = await fetch('/api/tasks/'+kind, {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(t)});
     const j = await r.json();
-    if(j.ok){ msg(kind+' ✓ '+t.name, 'ok'); }
+    if(j.ok){
+      msg(kind==='run'
+        ? '▶ Started '+t.name+' — running in the background; watch its status/last-run here.'
+        : kind+' ✓ '+t.name, 'ok');
+    }
     else { msg(kind+' failed: '+(j.error||'unknown'), 'err'); }
   } catch(e){ msg('Request failed: '+e,'err'); }
   finally { btn.disabled = false; setTimeout(load, 600); }
