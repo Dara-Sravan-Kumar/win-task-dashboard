@@ -21,6 +21,7 @@ Binds to 127.0.0.1 only (triggering tasks is privileged; keep it local).
 
 from __future__ import annotations
 
+import fnmatch
 import http.server
 import json
 import subprocess
@@ -35,6 +36,37 @@ HOST = "127.0.0.1"
 PORT = 8787
 ROOT = Path(__file__).resolve().parent
 EXPORT_ROOT = ROOT / "exports"
+
+# The dashboard shows ONLY tasks you opt into (an allowlist), so other apps'
+# noise (Zoom, Nvidia, ...) stays out. Membership is either an explicit
+# name/glob in "include", or living under a watched Task Scheduler folder.
+WATCH_FILE = ROOT / "watch.json"
+_DEFAULT_WATCH = {"include": ["mfmonitor-*"], "includeFolders": ["\\MyApps\\"]}
+
+
+def load_watch() -> dict:
+    if not WATCH_FILE.exists():
+        WATCH_FILE.write_text(json.dumps(_DEFAULT_WATCH, indent=2), encoding="utf-8")
+        return dict(_DEFAULT_WATCH)
+    try:
+        data = json.loads(WATCH_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"include": [], "includeFolders": []}
+    data.setdefault("include", [])
+    data.setdefault("includeFolders", [])
+    return data
+
+
+def save_watch(watch: dict) -> None:
+    WATCH_FILE.write_text(json.dumps(watch, indent=2), encoding="utf-8")
+
+
+def is_watched(task: dict, watch: dict) -> bool:
+    name = task.get("name", "")
+    path = task.get("path", "")
+    if any(fnmatch.fnmatch(name, pat) for pat in watch.get("include", [])):
+        return True
+    return any(path.startswith(f) for f in watch.get("includeFolders", []))
 
 _PREP = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); "
 
@@ -73,15 +105,26 @@ Get-ScheduledTask | ForEach-Object {
 """
 
 
-def list_tasks(include_ms: bool) -> list[dict]:
+def list_tasks(scope: str = "watch") -> list[dict]:
+    """scope: 'watch' (allowlisted only, default), 'user' (all non-Microsoft,
+    for discovery), or 'system' (everything, incl. Windows tasks)."""
     rc, out, err = _ps(_LIST_CMD)
     if not out.strip():
         raise RuntimeError(err.strip() or "Get-ScheduledTask returned nothing")
     data = json.loads(out)
     if isinstance(data, dict):
         data = [data]
-    if not include_ms:
+
+    watch = load_watch()
+    for t in data:
+        t["watched"] = is_watched(t, watch)
+
+    if scope == "watch":
+        data = [t for t in data if t["watched"]]
+    elif scope == "user":
         data = [t for t in data if not str(t.get("path", "")).startswith("\\Microsoft\\")]
+    # scope == "system": keep everything
+
     data.sort(key=lambda t: (t.get("next") or "9999", (t.get("name") or "").lower()))
     return data
 
@@ -109,6 +152,22 @@ def export_all() -> tuple[bool, str, str]:
     )
     rc, out, err = _ps("try { %s } catch { Write-Error $_.Exception.Message; exit 1 }" % cmd)
     return rc == 0, out.strip(), (err.strip() or str(dest))
+
+
+def watch_add(name: str) -> None:
+    watch = load_watch()
+    if name not in watch["include"]:
+        watch["include"].append(name)
+        save_watch(watch)
+
+
+def watch_remove(name: str) -> None:
+    """Remove a task from the allowlist — drops an exact 'include' entry and
+    any glob that matched it (so pinning off always works)."""
+    watch = load_watch()
+    watch["include"] = [p for p in watch["include"]
+                        if p != name and not fnmatch.fnmatch(name, p)]
+    save_watch(watch)
 
 
 def import_all(folder: str) -> tuple[bool, str, str]:
@@ -150,9 +209,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route.path in ("/", "/index.html"):
             self._send(200, HTML, "text/html")
         elif route.path == "/api/tasks":
-            include_ms = parse_qs(route.query).get("all", ["0"])[0] == "1"
+            scope = parse_qs(route.query).get("scope", ["watch"])[0]
+            if scope not in ("watch", "user", "system"):
+                scope = "watch"
             try:
-                self._send(200, json.dumps({"tasks": list_tasks(include_ms)}))
+                self._send(200, json.dumps({"scope": scope, "tasks": list_tasks(scope)}))
             except Exception as exc:  # noqa: BLE001
                 self._send(500, json.dumps({"error": str(exc)}))
         else:
@@ -176,6 +237,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ok, count, err = import_all(b["folder"])
                 self._send(200 if ok else 500,
                            json.dumps({"ok": ok, "count": count, "error": err}))
+            elif self.path == "/api/watch/add":
+                watch_add(b["name"])
+                self._send(200, json.dumps({"ok": True}))
+            elif self.path == "/api/watch/remove":
+                watch_remove(b["name"])
+                self._send(200, json.dumps({"ok": True}))
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except KeyError as exc:
@@ -240,6 +307,12 @@ HTML = r"""<!doctype html>
   .pill.Running { background: #1c7ed626; color: #1c7ed6; }
   .muted { opacity: .55; }
   .actions { display: flex; gap: 6px; white-space: nowrap; }
+  select { font: inherit; padding: 5px 8px; border-radius: 8px; color: inherit;
+           background: color-mix(in srgb, CanvasText 6%, Canvas);
+           border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); }
+  button.pin { border: none; background: none; font-size: 18px; padding: 2px 6px;
+               line-height: 1; color: color-mix(in srgb, CanvasText 40%, transparent); }
+  button.pin.on { color: #f5a623; }
   #msg { padding: 8px 18px; font-size: 13px; min-height: 20px; }
   .err { color: #e03535; } .ok { color: #2f9e44; }
 </style>
@@ -247,7 +320,13 @@ HTML = r"""<!doctype html>
 <body>
 <header>
   <h1>Windows Task Dashboard</h1>
-  <label class="toggle"><input type="checkbox" id="showMs"> show Microsoft tasks</label>
+  <label class="toggle">Show:
+    <select id="scope">
+      <option value="watch">Pinned only</option>
+      <option value="user">All my tasks</option>
+      <option value="system">Everything (incl. system)</option>
+    </select>
+  </label>
   <button onclick="load()">Refresh</button>
   <button onclick="doExport()">Export all</button>
   <button onclick="doImport()">Import…</button>
@@ -256,9 +335,9 @@ HTML = r"""<!doctype html>
 <div class="wrap">
   <table>
     <thead><tr>
-      <th>Task</th><th>Next run</th><th>Last run</th><th>Status</th><th></th>
+      <th></th><th>Task</th><th>Next run</th><th>Last run</th><th>Status</th><th></th>
     </tr></thead>
-    <tbody id="rows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
   </table>
 </div>
 <script>
@@ -270,20 +349,24 @@ function resultText(r){ if(r===0) return 'OK';
   return r==null ? '' : '0x'+(r>>>0).toString(16); }
 function msg(t, cls){ const m=$('#msg'); m.textContent=t; m.className=cls||''; }
 
+let SCOPE = 'watch';
 async function load(){
-  const all = $('#showMs').checked ? 1 : 0;
+  SCOPE = $('#scope').value;
   try {
-    const r = await fetch('/api/tasks?all='+all);
+    const r = await fetch('/api/tasks?scope='+SCOPE);
     const j = await r.json();
     if(j.error){ msg('Error: '+j.error,'err'); return; }
     render(j.tasks);
-    msg(j.tasks.length + ' tasks', 'muted');
+    msg(j.tasks.length + (SCOPE==='watch' ? ' pinned task(s)' : ' task(s)'), 'muted');
   } catch(e){ msg('Failed to load: '+e,'err'); }
 }
 function render(tasks){
   const rows = tasks.map(t => {
     const st = (t.state||'').replace(/[^A-Za-z]/g,'');
+    const star = t.watched ? '★' : '☆';
     return `<tr>
+      <td><button class="pin ${t.watched?'on':''}" title="Pin to dashboard"
+                  onclick='pin(${J(t)}, ${t.watched?1:0}, this)'>${star}</button></td>
       <td><div class="name">${esc(t.name)}</div>
           <div class="path">${esc(t.path)}${t.action?' · '+esc(t.action):''}</div></td>
       <td>${fmt(t.next)}</td>
@@ -296,7 +379,20 @@ function render(tasks){
           : `<button onclick='act("disable",${J(t)},this)'>Disable</button>`}
       </div></td></tr>`;
   }).join('');
-  $('#rows').innerHTML = rows || '<tr><td colspan="5" class="muted">No tasks.</td></tr>';
+  const empty = SCOPE==='watch'
+    ? 'No pinned tasks yet — switch to <b>All my tasks</b> and click ☆ to add ones you want.'
+    : 'No tasks.';
+  $('#rows').innerHTML = rows || `<tr><td colspan="6" class="muted">${empty}</td></tr>`;
+}
+async function pin(t, isOn, btn){
+  btn.disabled = true;
+  const kind = isOn ? 'remove' : 'add';
+  try {
+    await fetch('/api/watch/'+kind, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:t.name})});
+    msg((isOn?'Unpinned ':'Pinned ')+t.name, 'ok');
+  } catch(e){ msg('Pin failed: '+e,'err'); }
+  finally { btn.disabled=false; load(); }
 }
 const esc = s => (s==null?'':String(s)).replace(/[&<>'"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
@@ -331,7 +427,7 @@ async function doImport(){
   else msg('Import failed: '+(j.error||'unknown'), 'err');
   load();
 }
-$('#showMs').addEventListener('change', load);
+$('#scope').addEventListener('change', load);
 load();
 </script>
 </body>

@@ -1,0 +1,8 @@
+{
+  "include": [
+    "mfmonitor-*"
+  ],
+  "includeFolders": [
+    "\\MyApps\\"
+  ]
+}
