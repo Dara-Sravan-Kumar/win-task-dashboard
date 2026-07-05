@@ -1,6 +1,7 @@
 {
   "include": [
-    "mfmonitor-*"
+    "mfmonitor-*",
+    "StockBot Daily Run"
   ],
   "includeFolders": [
     "\\MyApps\\"
