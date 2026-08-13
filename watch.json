@@ -12,7 +12,8 @@
     "Intraday StockBot",
     "Intraday StockBot Dashboard",
     "Intraday StockBot Equity",
-    "win-task-dashboard"
+    "win-task-dashboard",
+    "Govt Exam Dashboard"
   ],
   "includeFolders": [
     "\\MyApps\\"
