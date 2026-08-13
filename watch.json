@@ -1,7 +1,18 @@
 {
   "include": [
     "mfmonitor-*",
-    "StockBot Daily Run"
+    "StockBot Daily Run",
+    "OpenAlgo Server",
+    "IPOAlerts-Morning",
+    "IPOAlerts-Evening",
+    "IPOAlerts",
+    "StockBot Hourly Strategy Scan",
+    "MCXBot *",
+    "StockBot Web Dashboard",
+    "Intraday StockBot",
+    "Intraday StockBot Dashboard",
+    "Intraday StockBot Equity",
+    "win-task-dashboard"
   ],
   "includeFolders": [
     "\\MyApps\\"
