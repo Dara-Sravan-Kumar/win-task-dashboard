@@ -89,17 +89,63 @@ def _action(inner: str) -> tuple[bool, str]:
 
 
 _LIST_CMD = r"""
+function Fmt-Time($sb) {
+  if (-not $sb) { return $null }
+  try { return ([datetime]$sb).ToString('h:mm tt') } catch { return $null }
+}
+function Fmt-Dur($iso) {
+  if (-not $iso) { return $null }
+  try {
+    $ts = [System.Xml.XmlConvert]::ToTimeSpan([string]$iso)
+    if ($ts.TotalMinutes -lt 60) { return ('{0}m' -f [int]$ts.TotalMinutes) }
+    if ($ts.Minutes -eq 0) { return ('{0}h' -f [int][math]::Floor($ts.TotalHours)) }
+    return ('{0}h{1}m' -f [int][math]::Floor($ts.TotalHours), $ts.Minutes)
+  } catch { return [string]$iso }
+}
+function Describe-Trigger($t) {
+  $cls = [string]$t.CimClass.CimClassName
+  switch ($cls) {
+    'MSFT_TaskLogonTrigger'        { $base = 'At logon' }
+    'MSFT_TaskBootTrigger'         { $base = 'At startup' }
+    'MSFT_TaskRegistrationTrigger' { $base = 'On registration' }
+    'MSFT_TaskDailyTrigger' {
+        $tm = Fmt-Time $t.StartBoundary
+        if ($t.DaysInterval -gt 1) { $base = "Every $($t.DaysInterval) days" } else { $base = 'Daily' }
+        if ($tm) { $base = "$base at $tm" }
+    }
+    'MSFT_TaskWeeklyTrigger' {
+        $tm = Fmt-Time $t.StartBoundary
+        if ($tm) { $base = "Weekly at $tm" } else { $base = 'Weekly' }
+    }
+    'MSFT_TaskMonthlyTrigger'    { $base = 'Monthly' }
+    'MSFT_TaskMonthlyDOWTrigger' { $base = 'Monthly' }
+    'MSFT_TaskTimeTrigger' {
+        $tm = Fmt-Time $t.StartBoundary
+        if ($tm) { $base = "Once at $tm" } else { $base = 'Once' }
+    }
+    'MSFT_TaskSessionStateChangeTrigger' { $base = 'On session change' }
+    'MSFT_TaskEventTrigger'      { $base = 'On event' }
+    default { $base = ($cls -replace 'MSFT_Task','' -replace 'Trigger','') }
+  }
+  if ($t.Repetition -and $t.Repetition.Interval) {
+    $iv = Fmt-Dur $t.Repetition.Interval
+    if ($iv) { $base = "$base, every $iv" }
+  }
+  if ($t.Enabled -eq $false) { $base = "$base (off)" }
+  return $base
+}
 Get-ScheduledTask | ForEach-Object {
   $i = $_ | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
   [pscustomobject]@{
-    name   = $_.TaskName
-    path   = $_.TaskPath
-    state  = [string]$_.State
-    author = $_.Author
-    action = (($_.Actions | ForEach-Object { $_.Execute }) -join '; ')
-    next   = $(if ($i -and $i.NextRunTime) { $i.NextRunTime.ToString('o') } else { $null })
-    last   = $(if ($i -and $i.LastRunTime) { $i.LastRunTime.ToString('o') } else { $null })
-    result = $(if ($i) { $i.LastTaskResult } else { $null })
+    name     = $_.TaskName
+    path     = $_.TaskPath
+    state    = [string]$_.State
+    author   = $_.Author
+    action   = (($_.Actions | ForEach-Object { $_.Execute }) -join '; ')
+    schedule = (($_.Triggers | ForEach-Object { Describe-Trigger $_ }) -join '; ')
+    next     = $(if ($i -and $i.NextRunTime) { $i.NextRunTime.ToString('o') } else { $null })
+    last     = $(if ($i -and $i.LastRunTime) { $i.LastRunTime.ToString('o') } else { $null })
+    result   = $(if ($i) { $i.LastTaskResult } else { $null })
   }
 } | ConvertTo-Json -Depth 3
 """
@@ -300,6 +346,7 @@ HTML = r"""<!doctype html>
   tr:hover td { background: color-mix(in srgb, CanvasText 5%, transparent); }
   .name { font-weight: 600; }
   .path, .action { opacity: .6; font-size: 12px; word-break: break-all; }
+  .sched { white-space: nowrap; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px;
           background: color-mix(in srgb, CanvasText 12%, transparent); }
   .pill.Ready { background: #2f9e4426; color: #2f9e44; }
@@ -335,9 +382,9 @@ HTML = r"""<!doctype html>
 <div class="wrap">
   <table>
     <thead><tr>
-      <th></th><th>Task</th><th>Next run</th><th>Last run</th><th>Status</th><th></th>
+      <th></th><th>Task</th><th>Schedule</th><th>Next run</th><th>Last run</th><th>Status</th><th></th>
     </tr></thead>
-    <tbody id="rows"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
   </table>
 </div>
 <script>
@@ -369,6 +416,7 @@ function render(tasks){
                   onclick='pin(${J(t)}, ${t.watched?1:0}, this)'>${star}</button></td>
       <td><div class="name">${esc(t.name)}</div>
           <div class="path">${esc(t.path)}${t.action?' · '+esc(t.action):''}</div></td>
+      <td class="sched">${t.schedule ? esc(t.schedule) : '<span class="muted">—</span>'}</td>
       <td>${fmt(t.next)}</td>
       <td>${fmt(t.last)} <span class="muted">${resultText(t.result)}</span></td>
       <td><span class="pill ${st}">${esc(t.state)}</span></td>
@@ -382,7 +430,7 @@ function render(tasks){
   const empty = SCOPE==='watch'
     ? 'No pinned tasks yet — switch to <b>All my tasks</b> and click ☆ to add ones you want.'
     : 'No tasks.';
-  $('#rows').innerHTML = rows || `<tr><td colspan="6" class="muted">${empty}</td></tr>`;
+  $('#rows').innerHTML = rows || `<tr><td colspan="7" class="muted">${empty}</td></tr>`;
 }
 async function pin(t, isOn, btn){
   btn.disabled = true;
